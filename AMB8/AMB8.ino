@@ -1,7 +1,4 @@
-#include <BLEDevice.h>
-#include <BLEServer.h>
-#include <BLEUtils.h>
-#include <BLE2902.h>
+#include "BLEDevice.h"
 #include <Adafruit_NeoPixel.h>
 #include "data_types.h"
 #include "sensors.h"
@@ -9,6 +6,8 @@
 #include "feature_extraction.h"
 #include "ml_model.h"
 
+// Same UUIDs as the ESP32 version -- unchanged so the existing app can
+// connect to this board without any app-side changes.
 #define SERVICE_UUID        "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
 #define CHARACTERISTIC_UUID "beb5483e-36e1-4688-b7f5-ea07361b26a8"
 
@@ -17,8 +16,17 @@
 
 Adafruit_NeoPixel pixel(NUM_PIXELS, LED_PIN, NEO_GRB + NEO_KHZ800);
 
-BLECharacteristic *pCharacteristic;
-BLEServer *pServer;
+// Ameba's BLE library (BLEDevice.h) uses global BLEService/BLECharacteristic
+// objects plus a singleton `BLE` device, instead of ESP32's heap-allocated
+// BLEServer/BLECharacteristic pointers + BLE2902 descriptor. Functionally
+// equivalent -- same service, same characteristic, same notify behavior.
+BLEService enviroService(SERVICE_UUID);
+BLECharacteristic reportCharacteristic(CHARACTERISTIC_UUID);
+BLEAdvertData advData;
+BLEAdvertData scanRspData;
+
+bool notifyEnabled = false; // client has enabled notifications (CCCD)
+bool wasConnected = false;  // used to edge-detect connect/disconnect in loop()
 
 #pragma pack(push, 1)
 struct SensorReport {
@@ -49,18 +57,13 @@ void showConnectedLED() {
   pixel.show();
 }
 
-class MyServerCallbacks : public BLEServerCallbacks {
-  void onConnect(BLEServer* pServer) {
-    Serial.println("Device connected — LED -> blue");
-    showConnectedLED();
-  }
-
-  void onDisconnect(BLEServer* pServer) {
-    Serial.println("Device disconnected — LED -> green, restarting advertising");
-    showIdleLED();
-    pServer->getAdvertising()->start();
-  }
-};
+// Fires when a client enables/disables notifications on reportCharacteristic.
+// Ameba's BLEDevice has no server-side onConnect/onDisconnect callback like
+// ESP32's BLEServerCallbacks, so connect/disconnect LED + advertising-restart
+// handling is done by polling BLE.connected(0) in loop() instead (below).
+void notifCB(BLECharacteristic* chr, uint8_t connID, uint16_t cccd) {
+  notifyEnabled = (cccd & GATT_CLIENT_CHAR_CONFIG_NOTIFY) != 0;
+}
 
 void setup() {
   Serial.begin(115200);
@@ -71,22 +74,24 @@ void setup() {
   pixel.setBrightness(50); // 0–255, keep it low so it's not blinding
   showIdleLED();
 
-  BLEDevice::init("EnviroMonitor-Test");
-  pServer = BLEDevice::createServer();
-  pServer->setCallbacks(new MyServerCallbacks());
+  reportCharacteristic.setReadProperty(true);
+  reportCharacteristic.setReadPermissions(GATT_PERM_READ);
+  reportCharacteristic.setNotifyProperty(true);
+  reportCharacteristic.setCCCDCallback(notifCB);
+  reportCharacteristic.setBufferLen(sizeof(SensorReport));
 
-  BLEService *pService = pServer->createService(SERVICE_UUID);
-  pCharacteristic = pService->createCharacteristic(
-                      CHARACTERISTIC_UUID,
-                      BLECharacteristic::PROPERTY_READ |
-                      BLECharacteristic::PROPERTY_NOTIFY
-                    );
-  pCharacteristic->addDescriptor(new BLE2902());
-  pService->start();
+  enviroService.addCharacteristic(reportCharacteristic);
 
-  BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
-  pAdvertising->addServiceUUID(SERVICE_UUID);
-  pAdvertising->start();
+  advData.addFlags(GAP_ADTYPE_FLAGS_LIMITED | GAP_ADTYPE_FLAGS_BREDR_NOT_SUPPORTED);
+  advData.addCompleteName("EnviroMonitor-Test");
+  scanRspData.addCompleteServices(BLEUUID(SERVICE_UUID));
+
+  BLE.init();
+  BLE.configAdvert()->setAdvData(advData);
+  BLE.configAdvert()->setScanRspData(scanRspData);
+  BLE.configServer(1);
+  BLE.addService(enviroService);
+  BLE.beginPeripheral();
 
   Serial.println("BLE advertising started...");
   Serial.print("sizeof(SensorReport) = ");
@@ -110,11 +115,28 @@ void sendReport(RawSensorData raw, float temp, ClassificationResult result) {
   report.classification = result.classification;
   report.confidenceScore = result.confidenceScore;
 
-  pCharacteristic->setValue((uint8_t*)&report, sizeof(report));
-  pCharacteristic->notify();
+  reportCharacteristic.setData((uint8_t*)&report, sizeof(report));
+  if (BLE.connected(0) && notifyEnabled) {
+    reportCharacteristic.notify(0);
+  }
 }
 
 void loop() {
+  // Connect/disconnect edge detection -- mirrors the ESP32 code's
+  // MyServerCallbacks::onConnect()/onDisconnect(), done here via polling
+  // since Ameba's BLEDevice doesn't expose those as callbacks.
+  bool isConnected = BLE.connected(0);
+  if (isConnected && !wasConnected) {
+    Serial.println("Device connected — LED -> blue");
+    showConnectedLED();
+  }
+  if (!isConnected && wasConnected) {
+    Serial.println("Device disconnected — LED -> green, restarting advertising");
+    showIdleLED();
+    BLE.configAdvert()->startAdv();
+  }
+  wasConnected = isConnected;
+
   RawSensorData raw = readAllSensors();
   RawSensorData processed = processSignal(raw);
   ExtractedFeatures features = extractFeatures(processed);
@@ -143,8 +165,6 @@ void loop() {
   Serial.print(" | confidence: ");
   Serial.println(result.confidenceScore);
 
-  // BUG FIX: this was sending `raw` (uncalibrated ADC counts) — the
-  // calibrated `processed` values were computed but never actually sent.
   sendReport(processed, realTemp, result);
 
   delay(2000);

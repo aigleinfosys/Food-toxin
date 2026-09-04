@@ -1,21 +1,26 @@
 #include "sensors.h"
-#include <DHT.h>
+#include "DHT.h"
 
 // ============================================================
-// MATTERA - ESP32-S3 + MiCS-6814
+// MATTERA - AMB82-Mini (RTL8735B) + MiCS-6814
 // ============================================================
 
-// MiCS-6814 analog connections
-static const uint8_t CO_PIN  = 1;
-static const uint8_t NH3_PIN = 2;
-static const uint8_t NO2_PIN = 3;
+// MiCS-6814 analog connections.
+// AMB82-Mini exposes exactly 3 ADC-capable pins (A0/A1/A2), which
+// matches this project's 3-channel gas sensor array.
+static const uint8_t CO_PIN  = A0;
+static const uint8_t NH3_PIN = A1;
+static const uint8_t NO2_PIN = A2;
 
 // Number of ADC samples used per reading (trimmed-mean filtering)
 static const uint16_t ADC_SAMPLES = 50;
 
-// DHT22 ambient temperature/humidity sensor
-static const int DHT_PIN = 4;
-DHT dht(DHT_PIN, DHT22);
+// DHT22 ambient temperature/humidity sensor.
+// NOTE: GPIO 15 carried over from the ESP32 pin number -- AMB82-Mini has
+// a different GPIO map, verify this pin is free (not reserved for the
+// camera/flash interface) before wiring it up.
+static const int DHT_PIN = 15;
+static DHT dhtSensor(DHT_PIN, DHT22);
 
 
 // ============================================================
@@ -53,27 +58,19 @@ static float readGasADC(uint8_t pin) {
 
 void setupSensors() {
 
-  // 12-bit ADC
-  analogReadResolution(12);
-
-  // ADC attenuation
-  analogSetPinAttenuation(CO_PIN, ADC_11db);
-  analogSetPinAttenuation(NH3_PIN, ADC_11db);
-  analogSetPinAttenuation(NO2_PIN, ADC_11db);
-
-  // Configure ADC pins
-  pinMode(CO_PIN, INPUT);
-  pinMode(NH3_PIN, INPUT);
-  pinMode(NO2_PIN, INPUT);
+  // NOTE: analogReadResolution() / analogSetPinAttenuation() were
+  // ESP32-Arduino-core-only calls with no Ameba equivalent -- AMB82-Mini's
+  // ADC runs at its native resolution/range. See the ADC_MAX comment in
+  // signal_processing.cpp.
 
   Serial.println("MiCS-6814 ADC configured");
 
-  Serial.println("CO  -> GPIO 1");
-  Serial.println("NH3 -> GPIO 2");
-  Serial.println("NO2 -> GPIO 3");
+  Serial.println("CO  -> A0");
+  Serial.println("NH3 -> A1");
+  Serial.println("NO2 -> A2");
 
-  dht.begin();
-  Serial.println("DHT22 -> GPIO 4");
+  dhtSensor.begin();
+  Serial.println("DHT22 -> GPIO 15");
 }
 
 
@@ -112,45 +109,30 @@ RawSensorData readAllSensors() {
 
 
   // ----------------------------------------------------------
-  // 3. Read ADC voltage in millivolts
+  // 3. Print RAW ADC
   // ----------------------------------------------------------
   //
-  // These values are ONLY for debugging/calibration.
-  // They are NOT sent into the existing ML pipeline.
-  //
-
-  uint32_t co_mV  = analogReadMilliVolts(CO_PIN);
-  uint32_t nh3_mV = analogReadMilliVolts(NH3_PIN);
-  uint32_t no2_mV = analogReadMilliVolts(NO2_PIN);
-
-
-  // ----------------------------------------------------------
-  // 4. Print RAW ADC + voltage
-  // ----------------------------------------------------------
+  // NOTE: analogReadMilliVolts() was an ESP32-only helper with no Ameba
+  // equivalent -- dropped from this debug print. Raw ADC counts (still
+  // used by the pipeline) are unaffected.
 
   Serial.println("----------------------------------------");
 
   Serial.print("CO  : ");
   Serial.print(coADC);
-  Serial.print(" ADC / ");
-  Serial.print(co_mV);
-  Serial.println(" mV");
+  Serial.println(" ADC");
 
   Serial.print("NH3 : ");
   Serial.print(nh3ADC);
-  Serial.print(" ADC / ");
-  Serial.print(nh3_mV);
-  Serial.println(" mV");
+  Serial.println(" ADC");
 
   Serial.print("NO2 : ");
   Serial.print(no2ADC);
-  Serial.print(" ADC / ");
-  Serial.print(no2_mV);
-  Serial.println(" mV");
+  Serial.println(" ADC");
 
 
   // ----------------------------------------------------------
-  // 5. Sensors not connected yet
+  // 4. Sensors not connected yet
   // ----------------------------------------------------------
 
   data.so2  = 0.0f;
@@ -164,21 +146,17 @@ RawSensorData readAllSensors() {
 
 
   // ----------------------------------------------------------
-  // 6. DHT22 ambient temperature + humidity
+  // 5. DHT22 ambient temperature + humidity
   // ----------------------------------------------------------
 
-  data.humidity = dht.readHumidity();
-  data.temperature = dht.readTemperature();
+  data.temperature = dhtSensor.readTemperature();
+  data.humidity = dhtSensor.readHumidity();
 
-  if (isnan(data.humidity) || isnan(data.temperature)) {
-    Serial.println("DHT22 | ERROR: Failed to read sensor");
-  } else {
-    Serial.print("DHT22 Temp: ");
-    Serial.print(data.temperature, 2);
-    Serial.print(" C | Humidity: ");
-    Serial.print(data.humidity, 1);
-    Serial.println(" %");
-  }
+  Serial.print("DHT22 Temp: ");
+  Serial.print(data.temperature, 2);
+  Serial.print(" C | Humidity: ");
+  Serial.print(data.humidity, 1);
+  Serial.println(" %");
 
 
   // ----------------------------------------------------------
